@@ -1,0 +1,804 @@
+import { Button, Slider, ComboBox, HorizontalBox, CheckBox, ListView, LineEdit } from "std-widgets.slint";
+
+export struct LayerItem {
+    name: string,
+    visible: bool,
+    thumb: image,
+}
+
+component IconButton inherits Rectangle {
+    in property <string> label;
+    in property <string> tip;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: max(22px, label-text.preferred-width + 12px);
+    height: 22px;
+    border-radius: 3px;
+    background: ta.has-hover && root.enabled ? #3d424a : transparent;
+    ta := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
+    label-text := Text {
+        text: root.label;
+        font-size: 12px;
+        color: root.enabled ? #d8dce2 : #5c6168;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// The UI font has no arrow glyphs, so the undo/redo arrows are drawn as paths.
+component HistoryButton inherits Rectangle {
+    in property <bool> redo;
+    in property <bool> enabled: true;
+    in property <string> label;
+    callback clicked();
+    property <color> fg: root.enabled ? #e6e9ed : #5c6168;
+    width: row.preferred-width + 20px;
+    height: 32px;
+    border-radius: 4px;
+    background: !root.enabled ? #26292d : ta.pressed ? #474c55 : ta.has-hover ? #3d424a : #2f3237;
+    border-width: 1px;
+    border-color: #3c4047;
+    ta := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
+    row := HorizontalLayout {
+        alignment: center;
+        spacing: 6px;
+        if !root.redo: Path {
+            width: 16px; height: 16px; y: 8px;
+            viewbox-width: 16; viewbox-height: 16;
+            stroke: root.fg; stroke-width: 1.8px;
+            // ↶ : head points left on the top stroke, body curves round on the right
+            commands: "M 3 6 L 10 6 A 4 4 0 0 1 10 14 L 5 14 M 6 3 L 3 6 L 6 9";
+        }
+        if root.redo: Path {
+            width: 16px; height: 16px; y: 8px;
+            viewbox-width: 16; viewbox-height: 16;
+            stroke: root.fg; stroke-width: 1.8px;
+            // ↷ : mirror image of undo
+            commands: "M 13 6 L 6 6 A 4 4 0 0 0 6 14 L 11 14 M 10 3 L 13 6 L 10 9";
+        }
+        Text { text: root.label; color: root.fg; vertical-alignment: center; }
+    }
+}
+
+// Vertical drag handle between panels; reports horizontal drag distance.
+component Divider inherits Rectangle {
+    callback dragged(length);
+    width: 7px;
+    background: ta.pressed ? #4a6fa5 : ta.has-hover ? #3a3f47 : transparent;
+    Rectangle { width: 1px; background: #33373d; }
+    ta := TouchArea {
+        mouse-cursor: col-resize;
+        // pressed-x stays put while the divider follows the mouse, so this gives incremental moves
+        moved => { if self.pressed { root.dragged(self.mouse-x - self.pressed-x); } }
+    }
+}
+
+// A row of colour swatches; the selected one gets a blue ring.
+component Swatches inherits HorizontalLayout {
+    in property <color> selected;
+    in property <bool> enabled: true;
+    callback picked(color);
+    spacing: 2px;
+    for c in [#ffffff, #000000, #e53935, #fb8c00, #fdd835, #43a047, #00acc1, #1e88e5, #8e24aa, #ec407a, #9e9e9e, #6d4c41]: Rectangle {
+        width: 13px;
+        height: 13px;
+        border-radius: 3px;
+        background: c;
+        border-width: c == root.selected ? 2px : 1px;
+        border-color: c == root.selected ? #4a9eff : #50555c;
+        TouchArea { enabled: root.enabled; clicked => { root.picked(c); } }
+    }
+}
+
+component PropRow inherits HorizontalLayout {
+    in property <string> label;
+    spacing: 6px;
+    Text { text: root.label; color: #b8bdc4; width: 58px; vertical-alignment: center; font-size: 12px; }
+    @children
+}
+
+export component AppWindow inherits Window {
+    in property <string> window-title: "Clothing Studio";
+    title: root.window-title;
+    icon: @image-url("../assets/icon.png");
+    preferred-width: 1440px;
+    preferred-height: 820px;
+    background: #1b1d20;
+
+    in property <image> viewport-image;
+    in property <image> template-image;
+    in property <string> status;
+    in-out property <int> preset-index: 0;
+    // 0 = shirt, 1 = pants: which garment the template, layers and export refer to.
+    in property <int> garment: 0;
+    callback garment-chosen(int);
+    // Built-in presets followed by the user's saved templates.
+    in property <[string]> template-names: ["White short sleeve", "Black short sleeve", "White long sleeve", "Black long sleeve"];
+
+    // 2D view transform (pan in logical px, zoom = screen px per template px).
+    // While auto-fit is on, zoom/pan are derived from the panel size, so they stay right through
+    // window and divider resizes. Zooming or panning by hand switches to the user-* values.
+    in-out property <bool> auto-fit: true;
+    in-out property <float> user-zoom: 1.0;
+    in-out property <length> user-pan-x: 10px;
+    in-out property <length> user-pan-y: 24px;
+    out property <float> zoom: root.auto-fit ? max(0.1, min((tpl.width - 16px) / 585px, (tpl.height - 76px) / 559px)) : root.user-zoom;
+    out property <length> pan-x: root.auto-fit ? (tpl.width - 585px * root.zoom) / 2 : root.user-pan-x;
+    out property <length> pan-y: root.auto-fit ? 26px : root.user-pan-y;
+    /// Freeze the current (possibly fitted) view into the user-* values before a manual change.
+    public function take-manual-view() {
+        root.user-zoom = root.zoom;
+        root.user-pan-x = root.pan-x;
+        root.user-pan-y = root.pan-y;
+        root.auto-fit = false;
+    }
+
+    // Layers (top of stack first, like Photopea) and the selected layer's properties
+    in property <[LayerItem]> layers;
+    in property <int> selected-row: -1;
+    in-out property <float> sel-width;
+    in-out property <float> sel-rotation;
+    in-out property <float> sel-opacity;
+    in-out property <float> sel-brightness;
+    in-out property <float> sel-contrast;
+    in-out property <bool> sel-grayscale;
+    in-out property <bool> sel-invert;
+    in-out property <bool> sel-remove-bg;
+    in-out property <bool> sel-upscale;
+    in-out property <bool> sel-across;
+    in property <bool> upscale-busy;
+    // Text layers
+    in property <bool> sel-is-text;
+    in-out property <string> sel-text;
+    in-out property <int> sel-font;
+    in property <[string]> font-names;
+    in property <color> sel-text-color;
+    in property <color> sel-outline-color;
+    in-out property <float> sel-outline;
+    // Shading overlay of the garment being edited
+    in property <[string]> shading-names: ["None"];
+    in-out property <int> shading-index;
+    in-out property <float> shading-strength: 0.5;
+    // Tattoo template of the garment being edited (drawn under the shirt template)
+    in property <[string]> tattoo-names: ["None"];
+    in-out property <int> tattoo-index;
+    in-out property <float> tattoo-strength: 1.0;
+    in-out property <bool> tattoo-ink;
+    // 0 = Sharp, 1 = Smooth, 2 = Pixel (same order as compose::Quality::ALL)
+    in-out property <int> sel-quality;
+    // True while a background-removal job (download or AI) runs.
+    in property <bool> bg-busy;
+    in-out property <bool> sel-flip-h;
+    in-out property <bool> sel-flip-v;
+    in-out property <bool> sel-wrap;
+    // Panel sizes set by the dividers. view3d-share = the 3D view's share of the two views' width.
+    in-out property <float> view3d-share: 0.5;
+    in-out property <length> layers-w: 280px;
+    // Which body parts the 3D view shows (the torso always shows).
+    in-out property <bool> show-head: true;
+    in-out property <bool> show-arms: true;
+    in-out property <bool> show-legs: true;
+    callback parts-changed();
+    in property <bool> can-undo;
+    in property <bool> can-redo;
+    in property <string> sel-where;
+
+    out property <length> vp-width: vp.width;
+    out property <length> vp-height: vp.height;
+
+    callback preset-chosen(int);
+    callback load-template();
+    callback save-template();
+    callback new-project();
+    callback open-project();
+    callback save-project();
+    callback save-project-as();
+    callback delete-template();
+    callback load-rig();
+    callback import-art();
+    callback export-png();
+
+    // button: 0 = left, 1 = right, 2 = middle; then shift, ctrl
+    callback vp-down(length, length, int, bool, bool);
+    callback vp-move(length, length);
+    callback vp-up();
+    callback vp-leave();
+    callback vp-scroll(float);
+    callback vp-resized();
+    callback key(string, bool, bool); // text, shift, ctrl
+
+    callback tpl-down(length, length, int, bool, bool);
+    callback tpl-move(length, length, bool); // x, y, shift
+    // 2D cursor: 0 normal, 1 ↖↘, 2 ↗↙, 3 ↔, 4 ↕ (over a resize handle)
+    in property <int> tpl-cursor;
+    callback tpl-up();
+    callback tpl-scroll(float, length, length);
+
+    callback layer-select(int);
+    callback layer-visible(int, bool);
+    callback layer-up();
+    callback layer-down();
+    callback layer-duplicate();
+    callback layer-delete();
+    callback layer-rename(int, string);
+    callback prop-width(float);
+    callback prop-rotation(float);
+    callback prop-opacity(float);
+    callback prop-brightness(float);
+    callback prop-contrast(float);
+    callback prop-grayscale(bool);
+    callback prop-invert(bool);
+    callback prop-remove-bg(bool);
+    callback prop-upscale(bool);
+    callback prop-across(bool);
+    callback add-text();
+    callback match-base();
+    // Optional upload to Roblox (Open Cloud). The key itself never comes back to the UI.
+    in-out property <string> roblox-key-input;
+    in property <string> roblox-status;
+    in property <bool> roblox-has-key;
+    in property <bool> roblox-busy;
+    callback check-updates();
+    callback roblox-key-save(string);
+    callback roblox-key-remove();
+    callback upload-roblox();
+    public function show-roblox-settings() {
+        roblox-popup.show();
+    }
+    callback prop-text(string);
+    callback prop-font(int);
+    callback prop-text-color(color);
+    callback prop-outline-color(color);
+    callback prop-outline(float);
+    callback shading-chosen(int);
+    callback shading-import();
+    callback shading-strength-changed(float);
+    callback tattoo-chosen(int);
+    callback tattoo-import();
+    callback tattoo-strength-changed(float);
+    callback tattoo-ink-changed(bool);
+    callback prop-quality(int);
+    callback paste-art();
+    callback prop-flip-h(bool);
+    callback prop-flip-v(bool);
+    callback prop-wrap(bool);
+    callback prop-reset();
+    callback undo();
+    callback redo();
+
+    // Menu items deliberately have no `enabled` bindings: any change to the native Windows menu
+    // makes the window repaint white for a frame (a visible flash on paste / layer switch).
+    // The actions themselves do nothing when they don't apply.
+    MenuBar {
+        Menu {
+            title: "File";
+            MenuItem { title: "New project (Ctrl+N)"; activated => { root.new-project(); } }
+            MenuItem { title: "Open project… (Ctrl+O)"; activated => { root.open-project(); } }
+            MenuItem { title: "Save project (Ctrl+S)"; activated => { root.save-project(); } }
+            MenuItem { title: "Save project as… (Ctrl+Shift+S)"; activated => { root.save-project-as(); } }
+            MenuSeparator { }
+            MenuItem { title: "Import artwork…"; activated => { root.import-art(); } }
+            MenuItem { title: "Paste artwork (Ctrl+V)"; activated => { root.paste-art(); } }
+            MenuSeparator { }
+            MenuItem { title: "Load template…"; activated => { root.load-template(); } }
+            MenuItem { title: "Save as template…"; activated => { root.save-template(); } }
+            // Only saved templates (after the 4 built-in presets) can be deleted.
+            MenuItem { title: "Delete template"; activated => { root.delete-template(); } }
+            MenuSeparator { }
+            MenuItem { title: "Load rig (OBJ)…"; activated => { root.load-rig(); } }
+            MenuSeparator { }
+            MenuItem { title: "Export PNG…"; activated => { root.export-png(); } }
+            MenuItem { title: "Upload to Roblox"; activated => { root.upload-roblox(); } }
+            MenuItem { title: "Roblox upload settings…"; activated => { roblox-popup.show(); } }
+        }
+        Menu {
+            title: "Edit";
+            MenuItem { title: "Undo (Ctrl+Z)"; activated => { root.undo(); } }
+            MenuItem { title: "Redo (Ctrl+Y)"; activated => { root.redo(); } }
+            MenuSeparator { }
+            MenuItem { title: "Duplicate layer (Ctrl+D)"; activated => { root.layer-duplicate(); } }
+            MenuItem { title: "Delete layer (Del)"; activated => { root.layer-delete(); } }
+        }
+        Menu {
+            title: "View";
+            MenuItem { title: "Reset panel sizes"; activated => { root.view3d-share = 0.5; root.layers-w = 280px; } }
+            MenuItem { title: "Fit 2D template"; activated => { root.auto-fit = true; } }
+        }
+        Menu {
+            title: "Help";
+            MenuItem { title: "Check for updates…"; activated => { root.check-updates(); } }
+        }
+    }
+
+    roblox-popup := PopupWindow {
+        close-policy: no-auto-close;
+        x: (root.width - 480px) / 2;
+        y: 90px;
+        width: 480px;
+        Rectangle {
+            background: #24272b;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: #3c4047;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000080;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 10px;
+                Text { text: "Upload to Roblox (optional)"; color: #e6e9ed; font-size: 16px; font-weight: 600; }
+                Text {
+                    wrap: word-wrap;
+                    color: #b8bdc4;
+                    font-size: 12px;
+                    text: "Uploads the garment you're editing to your Roblox account as an image and copies its rbxassetid:// to the clipboard, ready to paste into ShirtTemplate / PantsTemplate in Studio.\n\nOne-time setup: on create.roblox.com go to Open Cloud → API Keys → Create API Key. Add the Assets API with Read and Write, allow IP 0.0.0.0/0 (or your IP), then paste the key here. It is stored in Windows Credential Manager on this PC only.";
+                }
+                LineEdit {
+                    input-type: password;
+                    placeholder-text: root.roblox-has-key ? "A key is saved — paste a new one to replace it" : "Paste your Open Cloud API key";
+                    text <=> root.roblox-key-input;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button { text: "Save & check"; primary: true; enabled: !root.roblox-busy; clicked => { root.roblox-key-save(root.roblox-key-input); } }
+                    Button { text: "Remove key"; enabled: root.roblox-has-key && !root.roblox-busy; clicked => { root.roblox-key-remove(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "Close"; clicked => { roblox-popup.close(); } }
+                }
+                Text { text: root.roblox-status; wrap: word-wrap; color: #9fc3ff; font-size: 12px; }
+            }
+        }
+    }
+
+    keys := FocusScope {
+        key-pressed(e) => {
+            root.key(e.text, e.modifiers.shift, e.modifiers.control);
+            accept
+        }
+
+        VerticalLayout {
+            // Compact toolbar: the rarer actions live in the File/Edit menus so the window can shrink.
+            HorizontalBox {
+                // Shirt | Pants: what is being edited (the 3D view always shows both).
+                Button { text: "Shirt"; primary: root.garment == 0; clicked => { root.garment-chosen(0); } }
+                Button { text: "Pants"; primary: root.garment == 1; clicked => { root.garment-chosen(1); } }
+                ComboBox {
+                    min-width: 160px;
+                    preferred-width: 240px;
+                    model: root.template-names;
+                    current-index <=> root.preset-index;
+                    selected => { root.preset-chosen(self.current-index); }
+                }
+                Button { text: "Import artwork…"; clicked => { root.import-art(); } }
+                HistoryButton { label: "Undo"; enabled: root.can-undo; clicked => { root.undo(); } }
+                HistoryButton { label: "Redo"; redo: true; enabled: root.can-redo; clicked => { root.redo(); } }
+                Rectangle { horizontal-stretch: 1; }
+                Button { text: root.roblox-busy ? "Uploading…" : "Upload to Roblox"; enabled: !root.roblox-busy; clicked => { root.upload-roblox(); } }
+                Button { text: "Export PNG…"; primary: true; clicked => { root.export-png(); } }
+            }
+
+            split := HorizontalLayout {
+                padding: 6px;
+                vertical-stretch: 1;
+                // ---------- 3D ----------
+                vp := Rectangle {
+                    // Both views start from 160px and share the remaining width by view3d-share.
+                    // (Stretch factors, not a computed width: that created a layout binding loop.)
+                    min-width: 160px;
+                    preferred-width: 160px;
+                    horizontal-stretch: root.view3d-share;
+                    background: #212429;
+                    clip: true;
+                    changed width => { root.vp-resized(); }
+                    changed height => { root.vp-resized(); }
+                    Image {
+                        x: 0; y: 0;
+                        source: root.viewport-image;
+                        width: parent.width;
+                        height: parent.height;
+                        image-fit: fill;
+                    }
+                    TouchArea {
+                        pointer-event(e) => {
+                            if e.kind == PointerEventKind.down {
+                                keys.focus();
+                                root.vp-down(self.mouse-x, self.mouse-y,
+                                    e.button == PointerEventButton.left ? 0 : e.button == PointerEventButton.right ? 1 : 2,
+                                    e.modifiers.shift, e.modifiers.control);
+                            } else if e.kind == PointerEventKind.up {
+                                root.vp-up();
+                            } else if e.kind == PointerEventKind.move {
+                                // `moved` only fires for the left button; this covers middle-drag too.
+                                root.vp-move(self.mouse-x, self.mouse-y);
+                            }
+                        }
+                        scroll-event(e) => {
+                            root.vp-scroll(e.delta-y / 1px);
+                            accept
+                        }
+                        changed has-hover => { if !self.has-hover { root.vp-leave(); } }
+                    }
+                    // Body part toggles, bottom-left of the 3D view
+                    Rectangle {
+                        x: 8px;
+                        y: parent.height - self.height - 8px;
+                        width: parts.preferred-width + 16px;
+                        height: 32px;
+                        border-radius: 4px;
+                        background: #1b1d20d0;
+                        parts := HorizontalLayout {
+                            padding-left: 8px;
+                            spacing: 10px;
+                            CheckBox { text: "Head"; checked <=> root.show-head; toggled => { root.parts-changed(); } }
+                            CheckBox { text: "Arms"; checked <=> root.show-arms; toggled => { root.parts-changed(); } }
+                            CheckBox { text: "Legs"; checked <=> root.show-legs; toggled => { root.parts-changed(); } }
+                        }
+                    }
+                    Text {
+                        x: 8px; y: 6px;
+                        width: parent.width - 16px;
+                        wrap: word-wrap;
+                        text: "3D · Middle-drag orbit · Shift+middle pan · Wheel zoom · Drag art to move it anywhere on the shirt · Numpad 1/3/7 views · Home reset";
+                        color: #8a9099;
+                        font-size: 11px;
+                    }
+                }
+
+                Divider {
+                    // width = 160px + extra * share, so share = (wanted - 160px) / extra
+                    dragged(dx) => {
+                        root.view3d-share = max(0.05, min((vp.width + dx - 160px) / (vp.width + tpl.width - 320px), 0.95));
+                    }
+                }
+
+                // ---------- 2D ----------
+                tpl := Rectangle {
+                    horizontal-stretch: 1 - root.view3d-share;
+                    min-width: 160px;
+                    preferred-width: 160px;
+                    background: #2a2c30;
+                    clip: true;
+                    Rectangle {
+                        x: root.pan-x;
+                        y: root.pan-y;
+                        width: 585px * root.zoom;
+                        height: 559px * root.zoom;
+                        border-width: 1px;
+                        border-color: #555;
+                        Image {
+                            source: root.template-image;
+                            width: parent.width;
+                            height: parent.height;
+                            image-rendering: pixelated;
+                        }
+                    }
+                    TouchArea {
+                        mouse-cursor: root.tpl-cursor == 1 ? MouseCursor.nwse-resize : root.tpl-cursor == 2 ? MouseCursor.nesw-resize : root.tpl-cursor == 3 ? MouseCursor.ew-resize : root.tpl-cursor == 4 ? MouseCursor.ns-resize : MouseCursor.default;
+                        pointer-event(e) => {
+                            if e.kind == PointerEventKind.down {
+                                keys.focus();
+                                root.tpl-down(self.mouse-x, self.mouse-y,
+                                    e.button == PointerEventButton.left ? 0 : e.button == PointerEventButton.right ? 1 : 2,
+                                    e.modifiers.shift, e.modifiers.control);
+                            } else if e.kind == PointerEventKind.up {
+                                root.tpl-up();
+                            } else if e.kind == PointerEventKind.move {
+                                root.tpl-move(self.mouse-x, self.mouse-y, e.modifiers.shift);
+                            }
+                        }
+                        scroll-event(e) => {
+                            root.tpl-scroll(e.delta-y / 1px, self.mouse-x, self.mouse-y);
+                            accept
+                        }
+                    }
+                    Text {
+                        x: 8px; y: 6px;
+                        text: "2D template 585 × 559 · Drag art · Middle-drag pan · Wheel zoom";
+                        color: #8a9099;
+                        font-size: 11px;
+                    }
+                    HorizontalLayout {
+                        y: parent.height - 38px;
+                        height: 32px;
+                        alignment: end;
+                        spacing: 4px;
+                        padding-right: 6px;
+                        Button { text: "−"; clicked => { root.take-manual-view(); root.user-zoom = max(0.1, root.user-zoom / 1.25); } }
+                        Text { text: "\{round(root.zoom * 100)}%"; vertical-alignment: center; color: #ddd; width: 48px; horizontal-alignment: center; }
+                        Button { text: "+"; clicked => { root.take-manual-view(); root.user-zoom = min(8.0, root.user-zoom * 1.25); } }
+                        Button { text: "Fit"; clicked => { root.auto-fit = true; } }
+                    }
+                }
+
+                Divider {
+                    // dragging right shrinks the Layers panel
+                    dragged(dx) => { root.layers-w = max(230px, min(root.layers-w - dx, 520px)); }
+                }
+
+                // ---------- Layers ----------
+                Rectangle {
+                    width: root.layers-w;
+                    background: #24272b;
+                    VerticalLayout {
+                        padding: 8px;
+                        spacing: 6px;
+
+                        HorizontalLayout {
+                            Text { text: "Layers"; color: #e6e9ed; font-size: 14px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; }
+                            IconButton { label: "Text"; tip: "Add a text layer"; clicked => { root.add-text(); } }
+                            IconButton { label: "Paste"; tip: "Paste image (Ctrl+V)"; clicked => { root.paste-art(); } }
+                            IconButton { label: "+"; tip: "Import artwork"; clicked => { root.import-art(); } }
+                        }
+
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: #1e2124;
+                            border-radius: 4px;
+                            if root.layers.length == 0: Text {
+                                text: "No layers yet.\nUse Import artwork… or +";
+                                color: #7b8189;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            ListView {
+                                for layer[i] in root.layers: row := Rectangle {
+                                    // true while the name is being edited (double-click the row)
+                                    property <bool> editing: false;
+                                    height: 44px;
+                                    background: i == root.selected-row ? #34507a : row-ta.has-hover ? #2c3036 : transparent;
+                                    row-ta := TouchArea {
+                                        clicked => { root.layer-select(i); keys.focus(); }
+                                        double-clicked => { root.layer-select(i); row.editing = true; }
+                                    }
+                                    HorizontalLayout {
+                                        padding-left: 6px;
+                                        padding-right: 6px;
+                                        spacing: 8px;
+                                        CheckBox {
+                                            checked: layer.visible;
+                                            toggled => { root.layer-visible(i, self.checked); }
+                                        }
+                                        Rectangle {
+                                            width: 34px;
+                                            height: 34px;
+                                            y: 5px;
+                                            background: #3a3d42;
+                                            border-radius: 2px;
+                                            Image { source: layer.thumb; width: 32px; height: 32px; image-fit: contain; }
+                                        }
+                                        if !row.editing: Text {
+                                            text: layer.name;
+                                            color: layer.visible ? #e6e9ed : #7b8189;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                            horizontal-stretch: 1;
+                                        }
+                                        // Enter or clicking away saves the new name, Esc cancels.
+                                        if row.editing: FocusScope {
+                                            horizontal-stretch: 1;
+                                            key-pressed(e) => {
+                                                if e.text == Key.Escape {
+                                                    row.editing = false;
+                                                    keys.focus();
+                                                    return accept;
+                                                }
+                                                reject
+                                            }
+                                            name-edit := LineEdit {
+                                                y: (parent.height - self.height) / 2;
+                                                width: parent.width;
+                                                text: layer.name;
+                                                init => {
+                                                    self.focus();
+                                                    self.select-all();
+                                                }
+                                                accepted(t) => {
+                                                    row.editing = false;
+                                                    root.layer-rename(i, t);
+                                                    keys.focus();
+                                                }
+                                                changed has-focus => {
+                                                    if !self.has-focus && row.editing {
+                                                        row.editing = false;
+                                                        root.layer-rename(i, self.text);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 2px;
+                            alignment: end;
+                            IconButton { label: "▲"; enabled: root.selected-row > 0; clicked => { root.layer-up(); } }
+                            IconButton { label: "▼"; enabled: root.selected-row >= 0 && root.selected-row < root.layers.length - 1; clicked => { root.layer-down(); } }
+                            IconButton { label: "Duplicate"; enabled: root.selected-row >= 0; clicked => { root.layer-duplicate(); } }
+                            IconButton { label: "Delete"; enabled: root.selected-row >= 0; clicked => { root.layer-delete(); } }
+                        }
+
+                        // Tattoo template (drawn under the shirt template: shows on bare skin)
+                        Rectangle {
+                            background: #1e2124;
+                            border-radius: 4px;
+                            height: tat.preferred-height;
+                            tat := VerticalLayout {
+                                padding: 8px;
+                                spacing: 6px;
+                                Text { text: "Tattoos (under the template)"; color: #b8bdc4; font-size: 12px; }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    ComboBox {
+                                        horizontal-stretch: 1;
+                                        model: root.tattoo-names;
+                                        current-index <=> root.tattoo-index;
+                                        selected => { root.tattoo-chosen(self.current-index); }
+                                    }
+                                    Button { text: "Import…"; clicked => { root.tattoo-import(); } }
+                                }
+                                if root.tattoo-index > 0: HorizontalLayout {
+                                    spacing: 8px;
+                                    Text { text: "Strength"; color: #b8bdc4; width: 58px; vertical-alignment: center; font-size: 12px; }
+                                    Slider { minimum: 0; maximum: 1; value <=> root.tattoo-strength; changed(v) => { root.tattoo-strength-changed(v); } }
+                                    CheckBox { text: "White = skin"; checked <=> root.tattoo-ink; toggled => { root.tattoo-ink-changed(self.checked); } }
+                                }
+                            }
+                        }
+
+                        // Shading overlay (whole garment, drawn over every layer)
+                        Rectangle {
+                            background: #1e2124;
+                            border-radius: 4px;
+                            height: shade.preferred-height;
+                            shade := VerticalLayout {
+                                padding: 8px;
+                                spacing: 6px;
+                                Text { text: "Shading"; color: #b8bdc4; font-size: 12px; }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    ComboBox {
+                                        horizontal-stretch: 1;
+                                        model: root.shading-names;
+                                        current-index <=> root.shading-index;
+                                        selected => { root.shading-chosen(self.current-index); }
+                                    }
+                                    Button { text: "Import…"; clicked => { root.shading-import(); } }
+                                }
+                                PropRow {
+                                    label: "Strength";
+                                    Slider { minimum: 0; maximum: 1; value <=> root.shading-strength; enabled: root.shading-index > 0; changed(v) => { root.shading-strength-changed(v); } }
+                                    Text { text: "\{round(root.shading-strength * 100)}%"; color: #d8dce2; width: 38px; vertical-alignment: center; font-size: 12px; }
+                                }
+                            }
+                        }
+
+                        // Properties of the selected layer
+                        Rectangle {
+                            background: #1e2124;
+                            border-radius: 4px;
+                            height: props.preferred-height;
+                            props := VerticalLayout {
+                                padding: 8px;
+                                spacing: 6px;
+                                Text { text: root.selected-row >= 0 ? "Properties — " + root.sel-where : "Select a layer to edit it"; color: #b8bdc4; font-size: 12px; }
+                                if root.sel-is-text: VerticalLayout {
+                                    spacing: 6px;
+                                    PropRow {
+                                        label: "Text";
+                                        LineEdit { text <=> root.sel-text; edited(t) => { root.prop-text(t); } }
+                                    }
+                                    PropRow {
+                                        label: "Font";
+                                        ComboBox { model: root.font-names; current-index <=> root.sel-font; selected => { root.prop-font(self.current-index); } }
+                                    }
+                                    PropRow {
+                                        label: "Fill";
+                                        Swatches { selected: root.sel-text-color; picked(c) => { root.prop-text-color(c); } }
+                                    }
+                                    PropRow {
+                                        label: "Outline";
+                                        Swatches { selected: root.sel-outline-color; picked(c) => { root.prop-outline-color(c); } }
+                                    }
+                                    PropRow {
+                                        label: "Thickness";
+                                        Slider { minimum: 0; maximum: 0.25; value <=> root.sel-outline; changed(v) => { root.prop-outline(v); } }
+                                        Text { text: "\{round(root.sel-outline * 100)}"; color: #d8dce2; width: 38px; vertical-alignment: center; font-size: 12px; }
+                                    }
+                                }
+                                PropRow {
+                                    label: "Size";
+                                    Slider { minimum: 0.05; maximum: 2.0; value <=> root.sel-width; enabled: root.selected-row >= 0; changed(v) => { root.prop-width(v); } }
+                                    Text { text: "\{round(root.sel-width * 100)}%"; color: #d8dce2; width: 38px; vertical-alignment: center; font-size: 12px; }
+                                }
+                                PropRow {
+                                    label: "Rotation";
+                                    Slider { minimum: -180; maximum: 180; value <=> root.sel-rotation; enabled: root.selected-row >= 0; changed(v) => { root.prop-rotation(v); } }
+                                    Text { text: "\{round(root.sel-rotation)}°"; color: #d8dce2; width: 38px; vertical-alignment: center; font-size: 12px; }
+                                }
+                                PropRow {
+                                    label: "Opacity";
+                                    Slider { minimum: 0; maximum: 1; value <=> root.sel-opacity; enabled: root.selected-row >= 0; changed(v) => { root.prop-opacity(v); } }
+                                    Text { text: "\{round(root.sel-opacity * 100)}%"; color: #d8dce2; width: 38px; vertical-alignment: center; font-size: 12px; }
+                                }
+                                PropRow {
+                                    label: "Brightness";
+                                    Slider { minimum: -1; maximum: 1; value <=> root.sel-brightness; enabled: root.selected-row >= 0; changed(v) => { root.prop-brightness(v); } }
+                                    Text { text: "\{round(root.sel-brightness * 100)}"; color: #d8dce2; width: 38px; vertical-alignment: center; font-size: 12px; }
+                                }
+                                PropRow {
+                                    label: "Contrast";
+                                    Slider { minimum: -1; maximum: 1; value <=> root.sel-contrast; enabled: root.selected-row >= 0; changed(v) => { root.prop-contrast(v); } }
+                                    Text { text: "\{round(root.sel-contrast * 100)}"; color: #d8dce2; width: 38px; vertical-alignment: center; font-size: 12px; }
+                                }
+                                PropRow {
+                                    label: "Quality";
+                                    ComboBox {
+                                        model: ["Sharp", "Smooth", "Pixel"];
+                                        current-index <=> root.sel-quality;
+                                        enabled: root.selected-row >= 0;
+                                        selected => { root.prop-quality(self.current-index); }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    CheckBox { text: "Grayscale"; checked <=> root.sel-grayscale; enabled: root.selected-row >= 0; toggled => { root.prop-grayscale(self.checked); } }
+                                    CheckBox { text: "Invert"; checked <=> root.sel-invert; enabled: root.selected-row >= 0; toggled => { root.prop-invert(self.checked); } }
+                                }
+                                CheckBox {
+                                    text: root.upscale-busy ? "Upscaling…" : "Upscale ×4 (AI)";
+                                    checked <=> root.sel-upscale;
+                                    enabled: root.selected-row >= 0 && !root.upscale-busy;
+                                    toggled => { root.prop-upscale(self.checked); }
+                                }
+                                CheckBox {
+                                    text: root.bg-busy ? "Removing background…" : "Remove background (AI)";
+                                    checked <=> root.sel-remove-bg;
+                                    enabled: root.selected-row >= 0 && !root.bg-busy;
+                                    toggled => { root.prop-remove-bg(self.checked); }
+                                }
+                                Button {
+                                    text: "Match shirt to art background";
+                                    enabled: root.selected-row >= 0;
+                                    clicked => { root.match-base(); }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    CheckBox { text: "Flip H"; checked <=> root.sel-flip-h; enabled: root.selected-row >= 0; toggled => { root.prop-flip-h(self.checked); } }
+                                    CheckBox { text: "Flip V"; checked <=> root.sel-flip-v; enabled: root.selected-row >= 0; toggled => { root.prop-flip-v(self.checked); } }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    CheckBox { text: "Wrap edges"; checked <=> root.sel-wrap; enabled: root.selected-row >= 0; toggled => { root.prop-wrap(self.checked); } }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    Button { text: "Reset"; enabled: root.selected-row >= 0; clicked => { root.prop-reset(); } }
+                                }
+                                // Front/back art continuing flat onto the sleeves (or legs) beside the torso
+                                CheckBox {
+                                    text: root.garment == 1 ? "Across front: torso + legs" : "Across front: torso + sleeves";
+                                    checked <=> root.sel-across;
+                                    enabled: root.selected-row >= 0;
+                                    toggled => { root.prop-across(self.checked); }
+                                }
+                            }
+                        }
+                        Text {
+                            text: "Ctrl+V paste · Ctrl+Z undo · Ctrl+Y redo · Del delete · Arrows nudge (Shift ×10) · Ctrl+D duplicate";
+                            color: #7b8189;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+
+            Text {
+                text: root.status;
+                color: #c8ccd2;
+                height: 24px;
+                vertical-alignment: center;
+                x: 10px;
+            }
+        }
+    }
+}

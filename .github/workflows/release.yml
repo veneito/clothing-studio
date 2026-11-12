@@ -1,0 +1,31 @@
+# Push a tag like v1.0.0 to build the Windows installer and publish it as a GitHub release.
+#   git tag v1.0.0 && git push origin v1.0.0
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+      - name: Installer
+        shell: pwsh
+        run: ./installer/build.ps1 -Version $env:GITHUB_REF_NAME.TrimStart('v')
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $setup = Get-ChildItem target/release/*-setup.exe | Select-Object -First 1
+          gh release create $env:GITHUB_REF_NAME $setup.FullName --title "Clothing Studio $env:GITHUB_REF_NAME" --generate-notes

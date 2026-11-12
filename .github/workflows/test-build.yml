@@ -1,0 +1,24 @@
+# Run by hand (Actions tab -> Test build -> Run workflow) to get a Windows installer to try out,
+# without publishing a release. Download it from the run's "Artifacts" section.
+name: Test build
+on: workflow_dispatch
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+      - name: Installer
+        shell: pwsh
+        run: ./installer/build.ps1 -Version ((cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clothing-studio-windows
+          path: target/release/*-setup.exe
+          if-no-files-found: error
