@@ -5,6 +5,8 @@ mod bgremove;
 mod compose;
 mod library;
 mod project;
+#[cfg(test)]
+mod quality;
 mod render;
 mod roblox;
 mod shading;
@@ -830,7 +832,7 @@ fn sync_layers(app: &AppWindow, s: &State) {
         .iter()
         .rev()
         .map(|l| {
-            let t = image::imageops::thumbnail(&*l.work, 32, 32);
+            let t = compose::to_display(&image::imageops::thumbnail(&*l.work, 32, 32));
             let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(t.as_raw(), t.width(), t.height());
             LayerItem { name: l.name.as_str().into(), visible: l.visible, thumb: slint::Image::from_rgba8(buf) }
         })

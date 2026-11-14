@@ -4,7 +4,7 @@
 use crate::avatar;
 use crate::template::{self, Face, Garment, Part};
 use glam::{Vec2, Vec3};
-use image::{imageops, RgbaImage};
+use image::{imageops, Rgba32FImage, RgbaImage};
 use std::rc::Rc;
 
 /// Template pixels per stud. The same on every classic shirt face (e.g. torso front 128 px / 2 studs).
@@ -15,8 +15,8 @@ pub struct Layer {
     pub name: String,
     /// Untouched source pixels (never modified). Shared so undo snapshots are cheap.
     pub source: Rc<RgbaImage>,
-    /// Premultiplied copy capped at 1024 px, used for drawing (see `working_copy`).
-    pub work: Rc<RgbaImage>,
+    /// Linear-light premultiplied f32 copy capped at 1024 px, used for drawing (see `working_copy`).
+    pub work: Rc<Rgba32FImage>,
     pub visible: bool,
     /// Continue art that crosses a face edge onto the neighbouring faces of the same part.
     pub wrap: bool,
@@ -235,11 +235,17 @@ impl Layer {
     /// Point in home-face template pixels -> layer-local pixel (0..w, 0..h) if inside the art box.
     fn local(&self, px: f32, py: f32) -> Option<(f32, f32)> {
         let (w, h) = self.size_px();
+        let (lx, ly) = self.local_unclipped(px, py);
+        (lx >= 0.0 && ly >= 0.0 && lx < w as f32 && ly < h as f32).then_some((lx, ly))
+    }
+
+    /// Like `local`, without the inside-the-box check.
+    fn local_unclipped(&self, px: f32, py: f32) -> (f32, f32) {
+        let (w, h) = self.size_px();
         let (cx, cy) = self.center_px();
         let (s, c) = self.rotation.to_radians().sin_cos();
         let (dx, dy) = (px - cx, py - cy);
-        let (lx, ly) = (dx * c + dy * s + w as f32 / 2.0, -dx * s + dy * c + h as f32 / 2.0);
-        (lx >= 0.0 && ly >= 0.0 && lx < w as f32 && ly < h as f32).then_some((lx, ly))
+        (dx * c + dy * s + w as f32 / 2.0, -dx * s + dy * c + h as f32 / 2.0)
     }
 
     /// A texel of (part, face) expressed in the home face's template-pixel space, unfolding
@@ -394,6 +400,9 @@ fn draw_layer(out: &mut RgbaImage, l: &Layer) {
     }
     let (w, h) = l.size_px();
     let scaled = scaled_art(l, w, h);
+    // Off-grid rotations interpolate (texel centres no longer line up); right angles stay exact,
+    // and Pixel quality keeps its hard nearest-neighbour look.
+    let filtered = l.rotation.rem_euclid(90.0) != 0.0 && l.quality != Quality::Pixel;
     // The art's axis-aligned bounds in home-face pixels, to skip faces it can't touch.
     let (cx, cy) = l.center_px();
     let (s, c) = l.rotation.to_radians().sin_cos();
@@ -418,18 +427,53 @@ fn draw_layer(out: &mut RgbaImage, l: &Layer) {
         for y in rc.y..rc.y + rc.h {
             for x in rc.x..rc.x + rc.w {
                 let [hx, hy] = map(x as f32 + 0.5, y as f32 + 0.5);
-                let Some((lx, ly)) = l.local(hx, hy) else { continue };
-                let sp = *scaled.get_pixel(lx as u32, ly as u32);
+                let sp = if filtered {
+                    let (lx, ly) = l.local_unclipped(hx, hy);
+                    if lx <= -0.5 || ly <= -0.5 || lx >= w as f32 + 0.5 || ly >= h as f32 + 0.5 {
+                        continue;
+                    }
+                    sample_bilinear(&scaled, lx - 0.5, ly - 0.5)
+                } else {
+                    let Some((lx, ly)) = l.local(hx, hy) else { continue };
+                    *scaled.get_pixel(lx as u32, ly as u32)
+                };
                 blend(out.get_pixel_mut(x, y), sp, l.opacity);
             }
         }
     }
 }
 
+/// Bilinear lookup at continuous texel coords (texel centres at integers), weighting by alpha
+/// (premultiplied) so transparent neighbours add no colour fringe. Outside the image is
+/// transparent, which also anti-aliases the art's own border. Returns straight alpha.
+fn sample_bilinear(img: &RgbaImage, x: f32, y: f32) -> image::Rgba<u8> {
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let (w, h) = (img.width() as i64, img.height() as i64);
+    let mut acc = [0f32; 4];
+    for (dx, dy, wt) in [(0, 0, (1.0 - fx) * (1.0 - fy)), (1, 0, fx * (1.0 - fy)), (0, 1, (1.0 - fx) * fy), (1, 1, fx * fy)] {
+        let (sx, sy) = (x0 as i64 + dx, y0 as i64 + dy);
+        if wt <= 0.0 || sx < 0 || sy < 0 || sx >= w || sy >= h {
+            continue;
+        }
+        let p = img.get_pixel(sx as u32, sy as u32);
+        let a = p[3] as f32 * wt;
+        acc[3] += a;
+        for c in 0..3 {
+            acc[c] += p[c] as f32 * a;
+        }
+    }
+    if acc[3] <= 0.0 {
+        return image::Rgba([0, 0, 0, 0]);
+    }
+    let col = |c: usize| (acc[c] / acc[3]).round().clamp(0.0, 255.0) as u8;
+    image::Rgba([col(0), col(1), col(2), acc[3].round().clamp(0.0, 255.0) as u8])
+}
+
 /// What the shrunk art depends on (its position does not): the cache key.
 #[derive(PartialEq)]
 struct ScaleKey {
-    work: Rc<RgbaImage>,
+    work: Rc<Rgba32FImage>,
     size: (u32, u32),
     quality: Quality,
     flips: (bool, bool),
@@ -521,51 +565,120 @@ fn blend(d: &mut image::Rgba<u8>, s: image::Rgba<u8>, opacity: f32) {
 /// template, so this keeps full quality while big pasted images stay fast to redraw.
 const WORK_MAX: u32 = 1024;
 
-/// Premultiplied, size-capped copy of a source, made once per layer (see `Layer::work`).
-pub fn working_copy(src: &RgbaImage) -> RgbaImage {
-    let mut pm = src.clone();
-    for p in pm.pixels_mut() {
-        let a = p[3] as u32;
+/// sRGB byte -> linear light.
+pub(crate) static TO_LINEAR: std::sync::LazyLock<[f32; 256]> = std::sync::LazyLock::new(|| {
+    std::array::from_fn(|i| {
+        let c = i as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    })
+});
+
+pub(crate) fn to_srgb_u8(l: f32) -> u8 {
+    let l = l.clamp(0.0, 1.0);
+    let s = if l <= 0.003_130_8 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
+    (s * 255.0).round() as u8
+}
+
+/// Linear-light, premultiplied, f32 copy of a source capped at `WORK_MAX`, made once per layer
+/// (see `Layer::work`). Filtering in linear light keeps thin bright lines and fine detail at
+/// their true brightness when shrunk; f32 avoids 8-bit premultiply banding on soft edges.
+pub fn working_copy(src: &RgbaImage) -> Rgba32FImage {
+    let (w, h) = src.dimensions();
+    // Big sources are area-averaged by a whole factor while converting, so no full-size f32
+    // copy is ever made (a 4000 px picture would need 256 MB).
+    let f = (w.max(h) / WORK_MAX).max(1);
+    let mut pm = Rgba32FImage::new(w.div_ceil(f), h.div_ceil(f));
+    for (x, y, p) in src.enumerate_pixels() {
+        let a = p[3] as f32 / 255.0;
+        let q = pm.get_pixel_mut(x / f, y / f);
         for c in 0..3 {
-            p[c] = ((p[c] as u32 * a + 127) / 255) as u8;
+            q[c] += TO_LINEAR[p[c] as usize] * a;
+        }
+        q[3] += a;
+    }
+    if f > 1 {
+        for (x, y, q) in pm.enumerate_pixels_mut() {
+            let n = ((w - x * f).min(f) * (h - y * f).min(f)) as f32; // edge cells can be partial
+            q.0.iter_mut().for_each(|v| *v /= n);
         }
     }
-    let (w, h) = pm.dimensions();
-    if w.max(h) > WORK_MAX {
-        let k = WORK_MAX as f32 / w.max(h) as f32;
-        let (nw, nh) = (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1));
+    let (bw, bh) = pm.dimensions();
+    if bw.max(bh) > WORK_MAX {
+        let k = WORK_MAX as f32 / bw.max(bh) as f32;
+        let (nw, nh) = (((bw as f32 * k).round() as u32).max(1), ((bh as f32 * k).round() as u32).max(1));
         pm = imageops::resize(&pm, nw, nh, imageops::FilterType::Triangle);
     }
     pm
 }
 
-/// Resize a premultiplied working copy, returning straight alpha (no dark fringes at edges).
-fn resize_premultiplied(pm: &RgbaImage, w: u32, h: u32, quality: Quality) -> RgbaImage {
+/// Linear premultiplied f32 -> 8-bit sRGB straight alpha (the only quantization step).
+pub fn to_display(pm: &Rgba32FImage) -> RgbaImage {
+    RgbaImage::from_fn(pm.width(), pm.height(), |x, y| {
+        let p = pm.get_pixel(x, y);
+        let a = p[3].clamp(0.0, 1.0);
+        let au = (a * 255.0).round() as u8;
+        if au == 0 {
+            return image::Rgba([0, 0, 0, 0]);
+        }
+        image::Rgba([to_srgb_u8(p[0] / a), to_srgb_u8(p[1] / a), to_srgb_u8(p[2] / a), au])
+    })
+}
+
+/// Resize a working copy (linear, premultiplied, f32), returning 8-bit sRGB straight alpha.
+fn resize_premultiplied(pm: &Rgba32FImage, w: u32, h: u32, quality: Quality) -> RgbaImage {
     let mut out = match quality {
         Quality::Smooth => imageops::resize(pm, w, h, imageops::FilterType::Triangle),
         Quality::Pixel => imageops::resize(pm, w, h, imageops::FilterType::Nearest),
         Quality::Sharp => {
-            let r = imageops::resize(pm, w, h, imageops::FilterType::Lanczos3);
-            // Sharpen while still premultiplied (all four channels alike), then keep colour <=
-            // alpha, so edges against transparency get crisper without dark or light halos.
-            let mut r = imageops::unsharpen(&r, 0.6, 1);
-            for p in r.pixels_mut() {
-                for c in 0..3 {
-                    p[c] = p[c].min(p[3]);
+            // Resize in linear light, but sharpen in perceptual (sRGB-encoded) space: sharpening
+            // in linear light left bright grey halos beside thin lines on black.
+            let mut r = imageops::resize(pm, w, h, imageops::FilterType::CatmullRom);
+            clamp_premultiplied(&mut r);
+            recode(&mut r, srgb_f);
+            // Unsharp mask (amount 1, sigma 0.6) on all four premultiplied channels alike.
+            let blur = imageops::blur(&r, 0.6);
+            for (p, b) in r.pixels_mut().zip(blur.pixels()) {
+                for c in 0..4 {
+                    p[c] += p[c] - b[c];
                 }
             }
+            clamp_premultiplied(&mut r);
+            recode(&mut r, linear_f);
             r
         }
     };
-    for p in out.pixels_mut() {
-        let a = p[3] as u32;
-        if a > 0 {
+    clamp_premultiplied(&mut out);
+    to_display(&out)
+}
+
+/// Lanczos/sharpening overshoot: keep 0 <= colour <= alpha <= 1, so edges against
+/// transparency stay crisp without dark or light halos.
+fn clamp_premultiplied(img: &mut Rgba32FImage) {
+    for p in img.pixels_mut() {
+        p[3] = p[3].clamp(0.0, 1.0);
+        for c in 0..3 {
+            p[c] = p[c].clamp(0.0, p[3]);
+        }
+    }
+}
+
+/// Re-encode the colour of premultiplied pixels (unpremultiply, apply `f`, premultiply).
+fn recode(img: &mut Rgba32FImage, f: fn(f32) -> f32) {
+    for p in img.pixels_mut() {
+        if p[3] > 0.0 {
             for c in 0..3 {
-                p[c] = ((p[c] as u32 * 255 + a / 2) / a).min(255) as u8;
+                p[c] = f(p[c] / p[3]) * p[3];
             }
         }
     }
-    out
+}
+
+fn srgb_f(l: f32) -> f32 {
+    if l <= 0.003_130_8 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 }
+}
+
+fn linear_f(s: f32) -> f32 {
+    if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
 }
 
 #[cfg(test)]

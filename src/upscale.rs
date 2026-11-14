@@ -108,6 +108,10 @@ fn upscale_tiled(src: &RgbaImage, progress: &dyn Fn(String), mut model: impl FnM
     if w.max(h) > MAX_SIDE {
         return Err(format!("the picture is already {w}×{h}; upscaling is for small pictures (up to {MAX_SIDE} px)"));
     }
+    // The model only sees RGB: give fully transparent pixels their nearest visible colour, so
+    // whatever was hidden there (often black) can't bleed into the art's edges. Alpha is kept.
+    let filled = bleed_colours(src);
+    let src = &filled;
     let step = TILE - 2 * PAD;
     let (nx, ny) = (w.div_ceil(step), h.div_ceil(step));
     let mut out = RgbaImage::new(w * SCALE, h * SCALE);
@@ -159,9 +163,73 @@ fn upscale_tiled(src: &RgbaImage, progress: &dyn Fn(String), mut model: impl FnM
     Ok(out)
 }
 
+/// Copy of `src` where every fully transparent pixel takes the RGB of the nearest pixel with any
+/// opacity (breadth-first from all visible pixels). Alpha is unchanged; a fully transparent
+/// picture is returned as is.
+fn bleed_colours(src: &RgbaImage) -> RgbaImage {
+    let (w, h) = src.dimensions();
+    let mut out = src.clone();
+    let mut done: Vec<bool> = src.pixels().map(|p| p[3] > 0).collect();
+    let mut queue: std::collections::VecDeque<(u32, u32)> = src.enumerate_pixels().filter(|(_, _, p)| p[3] > 0).map(|(x, y, _)| (x, y)).collect();
+    while let Some((x, y)) = queue.pop_front() {
+        let rgb = *out.get_pixel(x, y);
+        for (dx, dy) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+            let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+            if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
+                continue;
+            }
+            let i = (ny as u32 * w + nx as u32) as usize;
+            if !done[i] {
+                done[i] = true;
+                let p = out.get_pixel_mut(nx as u32, ny as u32);
+                (p[0], p[1], p[2]) = (rgb[0], rgb[1], rgb[2]);
+                queue.push_back((nx as u32, ny as u32));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stand-in model that, like a real network, mixes neighbouring pixels: 3x3 box blur, then ×4.
+    fn blurry_x4(tile: &[f32]) -> Result<Vec<f32>, String> {
+        let t = TILE as usize;
+        let mut blurred = vec![0f32; 3 * t * t];
+        for c in 0..3 {
+            for y in 0..t {
+                for x in 0..t {
+                    let (mut s, mut n) = (0.0, 0.0);
+                    for yy in y.saturating_sub(1)..(y + 2).min(t) {
+                        for xx in x.saturating_sub(1)..(x + 2).min(t) {
+                            s += tile[c * t * t + yy * t + xx];
+                            n += 1.0;
+                        }
+                    }
+                    blurred[c * t * t + y * t + x] = s / n;
+                }
+            }
+        }
+        nearest_x4(&blurred)
+    }
+
+    #[test]
+    fn hidden_colours_under_transparency_do_not_fringe_the_edges() {
+        // red on the left, fully transparent *black* on the right (a typical PNG export)
+        let src = RgbaImage::from_fn(40, 40, |x, _| if x < 20 { image::Rgba([220, 20, 20, 255]) } else { image::Rgba([0, 0, 0, 0]) });
+        let out = upscale_tiled(&src, &|_| {}, blurry_x4).unwrap();
+        // every visible output pixel keeps the art's colour: no dark edge
+        for (x, y, p) in out.enumerate_pixels() {
+            if p[3] > 0 {
+                assert!(p[0] >= 215 && p[1] <= 25 && p[2] <= 25, "fringe at ({x},{y}): {p:?}");
+            }
+        }
+        let filled = bleed_colours(&src);
+        assert_eq!(*filled.get_pixel(39, 5), image::Rgba([220, 20, 20, 0]), "colour bled, alpha kept");
+        assert_eq!(bleed_colours(&RgbaImage::new(4, 4)), RgbaImage::new(4, 4), "all-transparent: unchanged");
+    }
 
     /// Stand-in model: nearest-neighbour ×4 of the tile.
     fn nearest_x4(tile: &[f32]) -> Result<Vec<f32>, String> {

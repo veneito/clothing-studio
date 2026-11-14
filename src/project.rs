@@ -269,7 +269,7 @@ pub fn from_json(text: &str) -> Result<(GarmentDoc, Option<GarmentDoc>), String>
             let upscaled = lf.upscaled.map(get).transpose()?.filter(|u| u.dimensions() == (source.width() * 4, source.height() * 4));
             let mut layer = Layer {
                 name: lf.name,
-                work: source.clone(), // rebuilt below
+                work: Rc::default(), // rebuilt below
                 source,
                 mask,
                 remove_bg: lf.remove_bg,
