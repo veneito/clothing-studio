@@ -55,6 +55,8 @@ pub struct Layer {
     pub across: Option<Garment>,
     /// Height relative to the source's own proportions (1 = unstretched); set by side/corner drags.
     pub stretch: f32,
+    /// Eraser strokes (alpha = how much is erased), same size as `source`. None until first used.
+    pub erased: Option<Rc<RgbaImage>>,
 }
 
 /// A resize handle on the art's box: (x side, y side), each -1, 0 or 1, not both 0.
@@ -115,6 +117,7 @@ impl Layer {
             upscale: false,
             across: None,
             stretch: 1.0,
+            erased: None,
         }
     }
 
@@ -124,17 +127,51 @@ impl Layer {
             (Some(u), true) => u.clone(),
             _ => self.source.clone(),
         };
-        match (&self.mask, self.remove_bg) {
-            // the mask is made at the source's size; stretch it to the upscaled picture if needed
-            (Some(m), true) if m.dimensions() != base.dimensions() => {
-                crate::bgremove::apply_mask(&base, &imageops::resize(&**m, base.width(), base.height(), imageops::FilterType::Triangle))
-            }
-            (Some(m), true) => crate::bgremove::apply_mask(&base, m),
+        // masks are made at the source's size; stretch them to the upscaled picture if needed
+        let fit = |m: &RgbaImage| match m.dimensions() == base.dimensions() {
+            true => m.clone(),
+            false => imageops::resize(m, base.width(), base.height(), imageops::FilterType::Triangle),
+        };
+        let mut out = match (&self.mask, self.remove_bg) {
+            (Some(m), true) => crate::bgremove::apply_mask(&base, &fit(m)),
             _ => (*base).clone(),
+        };
+        if let Some(e) = &self.erased {
+            for (p, e) in out.pixels_mut().zip(fit(e).pixels()) {
+                p[3] = (p[3] as u16 * (255 - e[3] as u16) / 255) as u8;
+            }
         }
+        out
     }
 
-    /// Call after changing `mask` or `remove_bg`.
+    /// Erase a soft round dab of `radius` template pixels at template point (px, py) on `part`/`face`.
+    /// Returns false when the point isn't on any face this layer reaches. Call `rebuild_work` after.
+    pub fn erase_at(&mut self, part: Part, face: Face, px: f32, py: f32, radius: f32) -> bool {
+        let Some((hx, hy)) = self.home_point(part, face, px, py) else { return false };
+        let (lx, ly) = self.local_unclipped(hx, hy);
+        let (w, h) = self.size_px();
+        let (sw, sh) = self.source.dimensions();
+        let fx = if self.flip_h { w as f32 - lx } else { lx };
+        let fy = if self.flip_v { h as f32 - ly } else { ly };
+        let (kx, ky) = (sw as f32 / w as f32, sh as f32 / h as f32);
+        let (cx, cy) = (fx * kx, fy * ky);
+        let (rx, ry) = (radius * kx, radius * ky);
+        let e = Rc::make_mut(self.erased.get_or_insert_with(|| Rc::new(RgbaImage::new(sw, sh))));
+        let (x0, x1) = ((cx - rx).floor().max(0.0) as u32, ((cx + rx).ceil().max(0.0) as u32).min(sw));
+        let (y0, y1) = ((cy - ry).floor().max(0.0) as u32, ((cy + ry).ceil().max(0.0) as u32).min(sh));
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let d = (((x as f32 + 0.5 - cx) / rx).powi(2) + ((y as f32 + 0.5 - cy) / ry).powi(2)).sqrt();
+                // full strength inside 70 % of the radius, fading to nothing at the edge
+                let v = ((1.0 - d) / 0.3).clamp(0.0, 1.0);
+                let p = &mut e.get_pixel_mut(x, y)[3];
+                *p = (*p).max((v * 255.0).round() as u8);
+            }
+        }
+        true
+    }
+
+    /// Call after changing `mask`, `remove_bg` or `erased`.
     pub fn rebuild_work(&mut self) {
         self.work = Rc::new(working_copy(&self.effective_source()));
     }
@@ -389,6 +426,9 @@ pub fn layer_at(doc: &Document, part: Part, face: Face, px: f32, py: f32) -> Opt
         let mut a = l.source.get_pixel(sx, sy)[3] as u32;
         if let (Some(m), true) = (&l.mask, l.remove_bg) {
             a = a * m.get_pixel(sx.min(m.width() - 1), sy.min(m.height() - 1))[3] as u32 / 255;
+        }
+        if let Some(e) = &l.erased {
+            a = a * (255 - e.get_pixel(sx.min(e.width() - 1), sy.min(e.height() - 1))[3] as u32) / 255;
         }
         (a > 24).then_some(i)
     })
@@ -712,6 +752,25 @@ mod tests {
 
     fn region(f: Face) -> template::Rect {
         template::region(Part::Torso, f)
+    }
+
+    #[test]
+    fn eraser_reveals_the_base_and_keeps_the_source() {
+        let mut d = doc_with(vec![Layer { width: 0.5, ..Layer::new("art".into(), solid()) }]);
+        let f = region(Face::Front);
+        let (cx, cy) = (f.x as f32 + f.w as f32 / 2.0, f.y as f32 + f.h as f32 / 2.0);
+        assert_eq!(*compose(&d).get_pixel(cx as u32, cy as u32), RED);
+        let before = d.layers[0].source.clone();
+        let snapshot = d.layers[0].clone(); // what an undo step holds
+        assert!(d.layers[0].erase_at(Part::Torso, Face::Front, cx, cy, 6.0));
+        assert!(!d.layers[0].erase_at(Part::LeftArm, Face::Front, 10.0, 10.0, 6.0), "a face this art doesn't reach");
+        d.layers[0].rebuild_work();
+        let out = compose(&d);
+        assert_eq!(*out.get_pixel(cx as u32, cy as u32), WHITE, "erased centre shows the base");
+        assert_eq!(*out.get_pixel(cx as u32 + 12, cy as u32), RED, "outside the brush untouched");
+        assert_eq!(d.layers[0].source, before, "source never modified");
+        assert!(snapshot.erased.is_none(), "undo snapshot not affected by later strokes");
+        assert_eq!(layer_at(&d, Part::Torso, Face::Front, cx, cy), None, "erased pixels can't be grabbed");
     }
 
     #[test]

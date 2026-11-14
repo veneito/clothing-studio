@@ -40,6 +40,8 @@ enum Drag {
     Art { view: View, offset: [f32; 2], moved: bool },
     /// Resizing the selected layer by a handle in the 2D view.
     Resize { handle: compose::Handle, start: compose::ResizeStart, moved: bool },
+    /// Eraser stroke on the selected layer; `last` = previous dab (part, face, template px).
+    Erase { view: View, last: Option<(Part, Face, [f32; 2])>, moved: bool },
 }
 
 struct State {
@@ -572,6 +574,7 @@ fn on_down(app: &AppWindow, st: &Shared, view: View, x: f32, y: f32, button: i32
         (View::ThreeD, 2) if ctrl => Drag::Zoom,
         (View::ThreeD, 2) => Drag::Orbit,
         (View::ThreeD, 1) => Drag::Pan,
+        (_, 0) if app.get_eraser() && s.selected.is_some() => Drag::Erase { view, last: None, moved: false },
         // a resize handle of the selected art (2D view) wins over grabbing the art itself
         (View::TwoD, 0) if handle_under(app, &s, x, y).is_some() => {
             let (i, handle) = handle_under(app, &s, x, y).unwrap();
@@ -601,10 +604,35 @@ fn on_down(app: &AppWindow, st: &Shared, view: View, x: f32, y: f32, button: i32
             }
         }
     };
+    let erasing = matches!(s.drag, Drag::Erase { .. });
     drop(s);
     if selection {
         selection_changed(app, st);
     }
+    if erasing {
+        on_move(app, st, x, y, false); // the click itself leaves a dab
+    }
+}
+
+/// Erase along the segment from the last dab to the cursor; returns the new last dab.
+fn erase_stroke(app: &AppWindow, s: &mut State, view: View, x: f32, y: f32, last: Option<(Part, Face, [f32; 2])>) -> Option<(Part, Face, [f32; 2])> {
+    let (p, f, uv) = surface_at(app, s, view, x, y)?;
+    let to = to_px(p, f, uv);
+    let r = app.get_eraser_size().max(0.5);
+    let l = &mut s.doc.layers[s.selected?];
+    // dabs every third of a radius along the segment, so fast drags leave no gaps (same face only)
+    let from = last.filter(|&(lp, lf, _)| (lp, lf) == (p, f)).map_or(to, |(_, _, a)| a);
+    let n = ((to[0] - from[0]).hypot(to[1] - from[1]) / (r / 3.0)).ceil().max(1.0) as usize;
+    let mut hit = false;
+    for k in 1..=n {
+        let t = k as f32 / n as f32;
+        hit |= l.erase_at(p, f, from[0] + (to[0] - from[0]) * t, from[1] + (to[1] - from[1]) * t, r);
+    }
+    if hit {
+        // shortcut: rebuilds the whole work copy per mouse move; fine up to ~1024 px sources, make it incremental if big photos lag.
+        l.rebuild_work();
+    }
+    Some((p, f, to))
 }
 
 /// Track the shirt face under the cursor (when not dragging) and redraw only when it changes.
@@ -677,6 +705,15 @@ fn on_move(app: &AppWindow, st: &Shared, x: f32, y: f32, shift: bool) {
             let z = app.get_zoom();
             let (px, py) = ((x - app.get_pan_x()) / z, (y - app.get_pan_y()) / z);
             s.doc.layers[i].resize_from(&start, handle, px, py, shift);
+            drop(s);
+            return queue_refresh(app, st);
+        }
+        Drag::Erase { view, last, moved } => {
+            if !moved {
+                s.checkpoint(None); // one undo step per stroke
+            }
+            let last = erase_stroke(app, &mut s, view, x, y, last);
+            s.drag = Drag::Erase { view, last, moved: true };
             drop(s);
             return queue_refresh(app, st);
         }
@@ -2007,7 +2044,7 @@ fn edit_text(app: &AppWindow, st: &Shared, key: Option<&'static str>, f: impl Fn
             let name = text_layer_name(&spec.text);
             edit_selected(app, st, key, |l| {
                 l.source = Rc::new(img);
-                (l.mask, l.remove_bg) = (None, false); // a mask from old text wouldn't fit
+                (l.mask, l.remove_bg, l.erased) = (None, false, None); // masks from old text wouldn't fit
                 l.name = name;
                 l.text = Some(spec);
                 l.rebuild_work();

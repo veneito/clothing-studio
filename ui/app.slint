@@ -144,6 +144,9 @@ export component AppWindow inherits Window {
     in-out property <bool> sel-grayscale;
     in-out property <bool> sel-invert;
     in-out property <bool> sel-remove-bg;
+    // Eraser: left-drag erases the selected layer in either view (Ctrl+Z undoes a stroke).
+    in-out property <bool> eraser;
+    in-out property <float> eraser-size: 8;
     in-out property <bool> sel-upscale;
     in-out property <bool> sel-across;
     in property <bool> upscale-busy;
@@ -472,7 +475,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     TouchArea {
-                        mouse-cursor: root.tpl-cursor == 1 ? MouseCursor.nwse-resize : root.tpl-cursor == 2 ? MouseCursor.nesw-resize : root.tpl-cursor == 3 ? MouseCursor.ew-resize : root.tpl-cursor == 4 ? MouseCursor.ns-resize : MouseCursor.default;
+                        mouse-cursor: root.eraser ? MouseCursor.crosshair : root.tpl-cursor == 1 ? MouseCursor.nwse-resize : root.tpl-cursor == 2 ? MouseCursor.nesw-resize : root.tpl-cursor == 3 ? MouseCursor.ew-resize : root.tpl-cursor == 4 ? MouseCursor.ns-resize : MouseCursor.default;
                         pointer-event(e) => {
                             if e.kind == PointerEventKind.down {
                                 keys.focus();
@@ -756,6 +759,12 @@ export component AppWindow inherits Window {
                                     checked <=> root.sel-remove-bg;
                                     enabled: root.selected-row >= 0 && !root.bg-busy;
                                     toggled => { root.prop-remove-bg(self.checked); }
+                                }
+                                CheckBox { text: "Eraser (drag on the art)"; checked <=> root.eraser; enabled: root.selected-row >= 0; }
+                                PropRow {
+                                    label: "Eraser size";
+                                    Slider { minimum: 1; maximum: 40; value <=> root.eraser-size; enabled: root.eraser; }
+                                    Text { text: "\{round(root.eraser-size)} px"; color: #d8dce2; width: 38px; vertical-alignment: center; font-size: 12px; }
                                 }
                                 Button {
                                     text: "Match shirt to art background";

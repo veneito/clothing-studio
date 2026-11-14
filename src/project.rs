@@ -128,6 +128,9 @@ struct LayerFile {
     across: Option<template::Garment>,
     #[serde(default = "one")]
     stretch: f32,
+    /// Index into `images` of the eraser mask, if the layer was erased.
+    #[serde(default)]
+    erased: Option<usize>,
 }
 
 fn one() -> f32 {
@@ -196,6 +199,7 @@ pub fn to_json(shirt: (&Document, Option<&str>), pants: (&Document, Option<&str>
                 upscale: l.upscale,
                 across: l.across,
                 stretch: l.stretch,
+                erased: l.erased.as_ref().map(&mut id),
             })
             .collect();
         let mut file = |o: &Overlay| OverlayFile { image: id(&o.image), strength: o.strength, preset: o.preset, name: o.name.clone(), ink: o.ink };
@@ -266,6 +270,7 @@ pub fn from_json(text: &str) -> Result<(GarmentDoc, Option<GarmentDoc>), String>
             }
             let fresh = Layer::new(String::new(), RgbaImage::new(1, 1));
             let mask = lf.mask.map(get).transpose()?.filter(|m| m.dimensions() == source.dimensions());
+            let erased = lf.erased.map(get).transpose()?.filter(|e| e.dimensions() == source.dimensions());
             let upscaled = lf.upscaled.map(get).transpose()?.filter(|u| u.dimensions() == (source.width() * 4, source.height() * 4));
             let mut layer = Layer {
                 name: lf.name,
@@ -279,6 +284,7 @@ pub fn from_json(text: &str) -> Result<(GarmentDoc, Option<GarmentDoc>), String>
                 upscale: lf.upscale && upscaled.is_some(),
                 across: lf.across,
                 stretch: finite(lf.stretch, 0.05, 20.0, 1.0),
+                erased,
                 upscaled,
                 visible: lf.visible,
                 wrap: lf.wrap,
@@ -339,6 +345,7 @@ mod tests {
         a.mask = Some(Rc::new(RgbaImage::from_fn(10, 6, |x, _| image::Rgba([255, 255, 255, if x < 5 { 255 } else { 0 }]))));
         a.remove_bg = true;
         a.quality = Quality::Pixel;
+        a.erased = Some(Rc::new(RgbaImage::from_fn(10, 6, |x, _| image::Rgba([0, 0, 0, if x == 0 { 255 } else { 0 }]))));
         a.rebuild_work();
         a.text = Some(crate::text::TextSpec { text: "Hi".into(), ..crate::text::TextSpec::default() });
         a.upscaled = Some(Rc::new(RgbaImage::from_pixel(40, 24, image::Rgba([9, 8, 7, 255]))));
@@ -373,7 +380,7 @@ mod tests {
         assert!(Rc::ptr_eq(&back.layers[0].source, &back.layers[1].source), "shared image loaded once");
         assert_eq!(crate::compose::compose(&back), crate::compose::compose(&doc), "renders identically");
         let f: ProjectFile = serde_json::from_str(&json).unwrap();
-        assert_eq!(f.images.len(), 8, "shirt base + shared artwork + its mask + upscaled copy + shading + tattoo + pants base + pants art");
+        assert_eq!(f.images.len(), 9, "shirt base + shared artwork + its mask + eraser mask + upscaled copy + shading + tattoo + pants base + pants art");
         assert!(back.layers[0].upscale && back.layers[0].upscaled.as_ref().is_some_and(|u| u.dimensions() == (40, 24)), "upscale restored");
         let u = back.underlay.as_ref().expect("tattoo saved");
         assert_eq!((u.strength, u.ink, u.name.as_str()), (0.7, true, "Sleeve"));
@@ -381,6 +388,7 @@ mod tests {
         assert_eq!((o.strength, o.preset, o.name.as_str()), (0.4, Some(1), "Wrinkles"));
         assert_eq!(back.layers[0].text.as_ref().map(|t| t.text.as_str()), Some("Hi"));
         assert!(back.layers[0].remove_bg && back.layers[0].mask.is_some(), "mask restored");
+        assert_eq!(back.layers[0].erased, doc.layers[0].erased, "eraser strokes restored");
         assert_eq!(back.layers[0].quality, Quality::Pixel);
         // a project from before quality modes loads as Smooth (how it looked when saved)
         let old = json.replace(r#","quality":"Pixel""#, "");
@@ -427,9 +435,9 @@ mod tests {
         let doc = sample();
         let mut cache = PngCache::default();
         let a = to_json((&doc, None), (&doc, None), &mut cache).unwrap();
-        assert_eq!(cache.0.len(), 6);
+        assert_eq!(cache.0.len(), 7);
         let b = to_json((&doc, None), (&doc, None), &mut cache).unwrap();
         assert_eq!(a, b);
-        assert_eq!(cache.0.len(), 6, "no re-encoding");
+        assert_eq!(cache.0.len(), 7, "no re-encoding");
     }
 }
