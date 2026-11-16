@@ -412,7 +412,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     on!(app, st, on_prop_remove_bg, |a, s, v| remove_bg_toggled(&a, s, v));
     on!(app, st, on_prop_upscale, |a, s, v| upscale_toggled(&a, s, v));
     on!(app, st, on_add_text, |a, s| add_text_layer(&a, s));
+    on!(app, st, on_add_paint_layer, |a, s| {
+        add_layer(&a, s, "Paint".into(), RgbaImage::new(512, 512));
+        a.set_paint(true);
+        a.set_eraser(false);
+    });
     on!(app, st, on_match_base, |a, s| match_base_to_art(&a, s));
+    on!(app, st, on_set_base_color, |a, s, c| set_base_colour(&a, s, [c.red(), c.green(), c.blue()], ""));
     on!(app, st, on_roblox_key_save, |a, s, k| roblox_key_save(&a, s, k.to_string()));
     on!(app, st, on_roblox_key_remove, |a, _s| {
         match roblox::delete_key() {
@@ -574,7 +580,20 @@ fn on_down(app: &AppWindow, st: &Shared, view: View, x: f32, y: f32, button: i32
         (View::ThreeD, 2) if ctrl => Drag::Zoom,
         (View::ThreeD, 2) => Drag::Orbit,
         (View::ThreeD, 1) => Drag::Pan,
-        (_, 0) if app.get_eraser() && s.selected.is_some() => Drag::Erase { view, last: None, moved: false },
+        (_, 0) if app.get_picker() => {
+            if let Some((p, f, uv)) = surface_at(app, &s, view, x, y) {
+                let [px, py] = to_px(p, f, uv);
+                let c = s.composed.get_pixel((px as u32).min(s.composed.width() - 1), (py as u32).min(s.composed.height() - 1));
+                if c[3] > 0 {
+                    let col = slint::Color::from_rgb_u8(c[0], c[1], c[2]);
+                    app.set_paint_color(col);
+                    app.set_paint_hue(col.to_hsva().hue);
+                }
+            }
+            app.set_picker(false);
+            Drag::None
+        }
+        (_, 0) if (app.get_eraser() || app.get_paint() || app.get_smudge()) && s.selected.is_some() => Drag::Erase { view, last: None, moved: false },
         // a resize handle of the selected art (2D view) wins over grabbing the art itself
         (View::TwoD, 0) if handle_under(app, &s, x, y).is_some() => {
             let (i, handle) = handle_under(app, &s, x, y).unwrap();
@@ -619,6 +638,9 @@ fn erase_stroke(app: &AppWindow, s: &mut State, view: View, x: f32, y: f32, last
     let (p, f, uv) = surface_at(app, s, view, x, y)?;
     let to = to_px(p, f, uv);
     let r = app.get_eraser_size().max(0.5);
+    let c = app.get_paint_color();
+    let paint = app.get_paint().then(|| [c.red(), c.green(), c.blue()]);
+    let smudge = app.get_smudge();
     let l = &mut s.doc.layers[s.selected?];
     // dabs every third of a radius along the segment, so fast drags leave no gaps (same face only)
     let from = last.filter(|&(lp, lf, _)| (lp, lf) == (p, f)).map_or(to, |(_, _, a)| a);
@@ -626,7 +648,14 @@ fn erase_stroke(app: &AppWindow, s: &mut State, view: View, x: f32, y: f32, last
     let mut hit = false;
     for k in 1..=n {
         let t = k as f32 / n as f32;
-        hit |= l.erase_at(p, f, from[0] + (to[0] - from[0]) * t, from[1] + (to[1] - from[1]) * t, r);
+        let (x, y) = (from[0] + (to[0] - from[0]) * t, from[1] + (to[1] - from[1]) * t);
+        let t0 = (k - 1) as f32 / n as f32;
+        let prev = [from[0] + (to[0] - from[0]) * t0, from[1] + (to[1] - from[1]) * t0];
+        hit |= match paint {
+            _ if smudge => prev != [x, y] && l.smudge_at(p, f, prev, x, y, r),
+            Some(rgb) => l.paint_at(p, f, x, y, r, rgb),
+            None => l.erase_at(p, f, x, y, r),
+        };
     }
     if hit {
         // shortcut: rebuilds the whole work copy per mouse move; fine up to ~1024 px sources, make it incremental if big photos lag.
@@ -1993,18 +2022,25 @@ fn upload_to_roblox(app: &AppWindow, st: &Shared) {
 /// Recolour the garment's template to the selected picture's background (its edge colour), so
 /// a photo with a plain background blends into the shirt. Keeps the template's shape; undoable.
 fn match_base_to_art(app: &AppWindow, st: &Shared) {
-    let mut s = st.borrow_mut();
+    let s = st.borrow_mut();
     let Some(src) = s.selected.and_then(|i| s.doc.layers.get(i)).map(|l| l.source.clone()) else { return };
     let Some(rgb) = template::border_colour(&src) else {
         return app.set_status("That picture's edges are transparent, so there's no background colour to match.".into());
     };
+    drop(s);
+    set_base_colour(app, st, rgb, " to match the picture's background");
+}
+
+/// Recolour the garment's base (one undo step).
+fn set_base_colour(app: &AppWindow, st: &Shared, rgb: [u8; 3], why: &str) {
+    let mut s = st.borrow_mut();
     s.checkpoint(None);
     s.doc.base = Rc::new(template::recolour(&s.doc.base, rgb));
     mark_custom_template(app, &mut s);
     let garment = s.garment.name();
     drop(s);
     refresh(app, st);
-    app.set_status(format!("The {garment} is now #{:02x}{:02x}{:02x} to match the picture's background (Ctrl+Z to undo).", rgb[0], rgb[1], rgb[2]).into());
+    app.set_status(format!("The {garment} is now #{:02x}{:02x}{:02x}{why} (Ctrl+Z to undo).", rgb[0], rgb[1], rgb[2]).into());
 }
 
 // ---------------------------------------------------------------- text layers
@@ -2044,7 +2080,7 @@ fn edit_text(app: &AppWindow, st: &Shared, key: Option<&'static str>, f: impl Fn
             let name = text_layer_name(&spec.text);
             edit_selected(app, st, key, |l| {
                 l.source = Rc::new(img);
-                (l.mask, l.remove_bg, l.erased) = (None, false, None); // masks from old text wouldn't fit
+                (l.mask, l.remove_bg, l.erased, l.painted) = (None, false, None, None); // masks from old text wouldn't fit
                 l.name = name;
                 l.text = Some(spec);
                 l.rebuild_work();

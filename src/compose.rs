@@ -57,6 +57,8 @@ pub struct Layer {
     pub stretch: f32,
     /// Eraser strokes (alpha = how much is erased), same size as `source`. None until first used.
     pub erased: Option<Rc<RgbaImage>>,
+    /// Brush paint (straight RGBA) drawn over the art, same size as `source`. None until first used.
+    pub painted: Option<Rc<RgbaImage>>,
 }
 
 /// A resize handle on the art's box: (x side, y side), each -1, 0 or 1, not both 0.
@@ -118,6 +120,7 @@ impl Layer {
             across: None,
             stretch: 1.0,
             erased: None,
+            painted: None,
         }
     }
 
@@ -141,37 +144,108 @@ impl Layer {
                 p[3] = (p[3] as u16 * (255 - e[3] as u16) / 255) as u8;
             }
         }
+        if let Some(pt) = &self.painted {
+            for (p, q) in out.pixels_mut().zip(fit(pt).pixels()) {
+                *p = over(*q, *p);
+            }
+        }
         out
     }
 
     /// Erase a soft round dab of `radius` template pixels at template point (px, py) on `part`/`face`.
     /// Returns false when the point isn't on any face this layer reaches. Call `rebuild_work` after.
     pub fn erase_at(&mut self, part: Part, face: Face, px: f32, py: f32, radius: f32) -> bool {
-        let Some((hx, hy)) = self.home_point(part, face, px, py) else { return false };
+        self.dab_at(part, face, px, py, radius, Brush::Erase)
+    }
+
+    /// Smudge: drags the layer's colours from template point `from` towards (px, py).
+    pub fn smudge_at(&mut self, part: Part, face: Face, from: [f32; 2], px: f32, py: f32, radius: f32) -> bool {
+        self.dab_at(part, face, px, py, radius, Brush::Smudge(from))
+    }
+
+    /// Like `erase_at`, but paints `rgb` over the art (also inside its transparent parts).
+    pub fn paint_at(&mut self, part: Part, face: Face, px: f32, py: f32, radius: f32, rgb: [u8; 3]) -> bool {
+        self.dab_at(part, face, px, py, radius, Brush::Paint(rgb))
+    }
+
+    /// Template point -> source pixel coordinates, if it's on a face this layer reaches.
+    fn to_source(&self, part: Part, face: Face, px: f32, py: f32) -> Option<(f32, f32)> {
+        let (hx, hy) = self.home_point(part, face, px, py)?;
         let (lx, ly) = self.local_unclipped(hx, hy);
         let (w, h) = self.size_px();
         let (sw, sh) = self.source.dimensions();
         let fx = if self.flip_h { w as f32 - lx } else { lx };
         let fy = if self.flip_v { h as f32 - ly } else { ly };
+        Some((fx * sw as f32 / w as f32, fy * sh as f32 / h as f32))
+    }
+
+    fn dab_at(&mut self, part: Part, face: Face, px: f32, py: f32, radius: f32, brush: Brush) -> bool {
+        let Some((cx, cy)) = self.to_source(part, face, px, py) else { return false };
+        let (w, h) = self.size_px();
+        let (sw, sh) = self.source.dimensions();
         let (kx, ky) = (sw as f32 / w as f32, sh as f32 / h as f32);
-        let (cx, cy) = (fx * kx, fy * ky);
         let (rx, ry) = (radius * kx, radius * ky);
+        // smudge offset in source pixels (where the colour is pulled from)
+        let shift = match brush {
+            Brush::Smudge(from) => match self.to_source(part, face, from[0], from[1]) {
+                Some((fx, fy)) => Some((cx - fx, cy - fy)),
+                None => return false,
+            },
+            _ => None,
+        };
+        let source = self.source.clone();
         let e = Rc::make_mut(self.erased.get_or_insert_with(|| Rc::new(RgbaImage::new(sw, sh))));
+        let pt = Rc::make_mut(self.painted.get_or_insert_with(|| Rc::new(RgbaImage::new(sw, sh))));
         let (x0, x1) = ((cx - rx).floor().max(0.0) as u32, ((cx + rx).ceil().max(0.0) as u32).min(sw));
         let (y0, y1) = ((cy - ry).floor().max(0.0) as u32, ((cy + ry).ceil().max(0.0) as u32).min(sh));
+        // shortcut: smudge sees source + eraser + paint, not the AI bg mask/upscale; fine unless smudging bg-removed edges.
+        let visible = |e: &RgbaImage, pt: &RgbaImage, x: f32, y: f32| {
+            let (x, y) = ((x.max(0.0) as u32).min(sw - 1), (y.max(0.0) as u32).min(sh - 1));
+            let mut s = *source.get_pixel(x, y);
+            s[3] = (s[3] as u16 * (255 - e.get_pixel(x, y)[3] as u16) / 255) as u8;
+            over(*pt.get_pixel(x, y), s)
+        };
+        // smudge reads the picture as it was before this dab
+        let pulled: Vec<_> = match shift {
+            Some((ox, oy)) => (y0..y1)
+                .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+                .map(|(x, y)| (visible(e, pt, x as f32, y as f32), visible(e, pt, x as f32 + 0.5 - ox, y as f32 + 0.5 - oy)))
+                .collect(),
+            None => Vec::new(),
+        };
+        let mut k = 0;
         for y in y0..y1 {
             for x in x0..x1 {
                 let d = (((x as f32 + 0.5 - cx) / rx).powi(2) + ((y as f32 + 0.5 - cy) / ry).powi(2)).sqrt();
                 // full strength inside 70 % of the radius, fading to nothing at the edge
                 let v = ((1.0 - d) / 0.3).clamp(0.0, 1.0);
-                let p = &mut e.get_pixel_mut(x, y)[3];
-                *p = (*p).max((v * 255.0).round() as u8);
+                let a = (v * 255.0).round() as u8;
+                let (ep, pp) = (&mut e.get_pixel_mut(x, y)[3], pt.get_pixel_mut(x, y));
+                match brush {
+                    // erasing removes paint too; painting is never hidden by old eraser strokes underneath
+                    Brush::Erase => {
+                        *ep = (*ep).max(a);
+                        pp[3] = (pp[3] as u16 * (255 - a as u16) / 255) as u8;
+                    }
+                    Brush::Paint([r, g, b]) => *pp = over(image::Rgba([r, g, b, a]), *pp),
+                    Brush::Smudge(_) => {
+                        let (here, from) = pulled[k];
+                        if v > 0.0 && here != from {
+                            let t = v * 0.6; // smudge strength
+                            let mix = |i: usize| (here[i] as f32 + (from[i] as f32 - here[i] as f32) * t).round() as u8;
+                            // the paint now holds the whole visible result, so hide the art underneath
+                            *pp = image::Rgba([mix(0), mix(1), mix(2), mix(3)]);
+                            *ep = 255;
+                        }
+                    }
+                }
+                k += 1;
             }
         }
         true
     }
 
-    /// Call after changing `mask`, `remove_bg` or `erased`.
+    /// Call after changing `mask`, `remove_bg`, `erased` or `painted`.
     pub fn rebuild_work(&mut self) {
         self.work = Rc::new(working_copy(&self.effective_source()));
     }
@@ -430,8 +504,30 @@ pub fn layer_at(doc: &Document, part: Part, face: Face, px: f32, py: f32) -> Opt
         if let Some(e) = &l.erased {
             a = a * (255 - e.get_pixel(sx.min(e.width() - 1), sy.min(e.height() - 1))[3] as u32) / 255;
         }
+        if let Some(p) = &l.painted {
+            a = a.max(p.get_pixel(sx.min(p.width() - 1), sy.min(p.height() - 1))[3] as u32);
+        }
         (a > 24).then_some(i)
     })
+}
+
+#[derive(Clone, Copy)]
+enum Brush {
+    Erase,
+    Paint([u8; 3]),
+    /// Template point of the previous dab.
+    Smudge([f32; 2]),
+}
+
+/// Straight-alpha "source over" of `top` onto `bot`.
+fn over(top: image::Rgba<u8>, bot: image::Rgba<u8>) -> image::Rgba<u8> {
+    let (ta, ba) = (top[3] as f32 / 255.0, bot[3] as f32 / 255.0);
+    let a = ta + ba * (1.0 - ta);
+    if a <= 0.0 {
+        return image::Rgba([0; 4]);
+    }
+    let ch = |i: usize| ((top[i] as f32 * ta + bot[i] as f32 * ba * (1.0 - ta)) / a).round() as u8;
+    image::Rgba([ch(0), ch(1), ch(2), (a * 255.0).round() as u8])
 }
 
 fn draw_layer(out: &mut RgbaImage, l: &Layer) {
@@ -752,6 +848,37 @@ mod tests {
 
     fn region(f: Face) -> template::Rect {
         template::region(Part::Torso, f)
+    }
+
+    #[test]
+    fn brush_paints_inside_transparent_art_and_eraser_removes_it() {
+        let mut d = doc_with(vec![Layer { width: 0.5, ..Layer::new("blank".into(), RgbaImage::new(64, 64)) }]);
+        let f = region(Face::Front);
+        let (cx, cy) = (f.x as f32 + f.w as f32 / 2.0, f.y as f32 + f.h as f32 / 2.0);
+        assert!(d.layers[0].paint_at(Part::Torso, Face::Front, cx, cy, 6.0, [255, 0, 0]));
+        d.layers[0].rebuild_work();
+        assert_eq!(layer_at(&d, Part::Torso, Face::Front, cx, cy), Some(0), "painted pixels can be grabbed");
+        assert_eq!(*compose(&d).get_pixel(cx as u32, cy as u32), RED, "paint drawn");
+        assert!(d.layers[0].erase_at(Part::Torso, Face::Front, cx, cy, 6.0));
+        d.layers[0].rebuild_work();
+        assert_eq!(*compose(&d).get_pixel(cx as u32, cy as u32), WHITE, "erased paint shows the base");
+    }
+
+    #[test]
+    fn smudge_drags_colour_along_the_stroke() {
+        let mut d = doc_with(vec![Layer { width: 0.5, ..Layer::new("blank".into(), RgbaImage::new(64, 64)) }]);
+        let f = region(Face::Front);
+        let (cx, cy) = (f.x as f32 + f.w as f32 / 2.0, f.y as f32 + f.h as f32 / 2.0);
+        d.layers[0].paint_at(Part::Torso, Face::Front, cx, cy, 4.0, [255, 0, 0]);
+        d.layers[0].rebuild_work();
+        assert_ne!(*compose(&d).get_pixel(cx as u32 + 6, cy as u32), RED, "nothing there before smudging");
+        for k in 1..=6 {
+            let x = cx + k as f32;
+            assert!(d.layers[0].smudge_at(Part::Torso, Face::Front, [x - 1.0, cy], x, cy, 4.0));
+        }
+        d.layers[0].rebuild_work();
+        let p = *compose(&d).get_pixel(cx as u32 + 6, cy as u32);
+        assert!(p[0] > 200 && p[1] < 200, "red pulled to the right: {p:?}");
     }
 
     #[test]

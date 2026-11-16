@@ -90,6 +90,49 @@ component Swatches inherits HorizontalLayout {
     }
 }
 
+// Photopea-style picker: saturation/brightness square plus a hue bar. `hue` is kept separately
+// so it survives picking greys (which have no hue).
+component ColorPicker inherits VerticalLayout {
+    in-out property <color> value;
+    in-out property <float> hue: 0;
+    in property <bool> enabled: true;
+    spacing: 4px;
+    sv := Rectangle {
+        height: 90px;
+        border-radius: 3px;
+        background: @linear-gradient(90deg, #ffffff 0%, hsv(root.hue, 1, 1) 100%);
+        Rectangle { border-radius: 3px; background: @linear-gradient(0deg, #000000 0%, #00000000 100%); }
+        Rectangle {
+            width: 9px; height: 9px; border-radius: 5px; border-width: 2px; border-color: #ffffff;
+            x: root.value.to-hsv().saturation * sv.width - 4.5px;
+            y: (1 - root.value.to-hsv().value) * sv.height - 4.5px;
+        }
+        TouchArea {
+            enabled: root.enabled;
+            function pick() {
+                root.value = hsv(root.hue, clamp(self.mouse-x / sv.width, 0, 1), 1 - clamp(self.mouse-y / sv.height, 0, 1));
+            }
+            pointer-event(e) => { if e.kind == PointerEventKind.down { self.pick(); } }
+            moved => { if self.pressed { self.pick(); } }
+        }
+    }
+    hb := Rectangle {
+        height: 10px;
+        border-radius: 3px;
+        background: @linear-gradient(90deg, #ff0000 0%, #ffff00 16.7%, #00ff00 33.3%, #00ffff 50%, #0000ff 66.7%, #ff00ff 83.3%, #ff0000 100%);
+        Rectangle { width: 3px; height: hb.height + 4px; y: -2px; background: #ffffff; x: root.hue / 360 * hb.width - 1.5px; }
+        TouchArea {
+            enabled: root.enabled;
+            function pick() {
+                root.hue = clamp(self.mouse-x / hb.width, 0, 1) * 359.9;
+                root.value = hsv(root.hue, root.value.to-hsv().saturation, root.value.to-hsv().value);
+            }
+            pointer-event(e) => { if e.kind == PointerEventKind.down { self.pick(); } }
+            moved => { if self.pressed { self.pick(); } }
+        }
+    }
+}
+
 component PropRow inherits HorizontalLayout {
     in property <string> label;
     spacing: 6px;
@@ -147,6 +190,15 @@ export component AppWindow inherits Window {
     // Eraser: left-drag erases the selected layer in either view (Ctrl+Z undoes a stroke).
     in-out property <bool> eraser;
     in-out property <float> eraser-size: 8;
+    // Paint brush: same drag as the eraser, but paints `paint-color` onto the selected layer.
+    in-out property <bool> paint;
+    in-out property <color> paint-color: #000000;
+    in-out property <float> paint-hue: 0;
+    // Smudge: same drag, pushes the selected layer's colours along the stroke.
+    in-out property <bool> smudge;
+    // Eyedropper: the next left-click picks the brush colour from the garment, then turns itself off.
+    in-out property <bool> picker;
+    callback add-paint-layer();
     in-out property <bool> sel-upscale;
     in-out property <bool> sel-across;
     in property <bool> upscale-busy;
@@ -236,6 +288,7 @@ export component AppWindow inherits Window {
     callback prop-across(bool);
     callback add-text();
     callback match-base();
+    callback set-base-color(color);
     // Optional upload to Roblox (Open Cloud). The key itself never comes back to the UI.
     in-out property <string> roblox-key-input;
     in property <string> roblox-status;
@@ -475,7 +528,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     TouchArea {
-                        mouse-cursor: root.eraser ? MouseCursor.crosshair : root.tpl-cursor == 1 ? MouseCursor.nwse-resize : root.tpl-cursor == 2 ? MouseCursor.nesw-resize : root.tpl-cursor == 3 ? MouseCursor.ew-resize : root.tpl-cursor == 4 ? MouseCursor.ns-resize : MouseCursor.default;
+                        mouse-cursor: root.eraser || root.paint || root.smudge || root.picker ? MouseCursor.crosshair : root.tpl-cursor == 1 ? MouseCursor.nwse-resize : root.tpl-cursor == 2 ? MouseCursor.nesw-resize : root.tpl-cursor == 3 ? MouseCursor.ew-resize : root.tpl-cursor == 4 ? MouseCursor.ns-resize : MouseCursor.default;
                         pointer-event(e) => {
                             if e.kind == PointerEventKind.down {
                                 keys.focus();
@@ -528,6 +581,7 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             Text { text: "Layers"; color: #e6e9ed; font-size: 14px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; }
                             IconButton { label: "Text"; tip: "Add a text layer"; clicked => { root.add-text(); } }
+                            IconButton { label: "Paint"; tip: "Add a blank layer to paint on"; clicked => { root.add-paint-layer(); } }
                             IconButton { label: "Paste"; tip: "Paste image (Ctrl+V)"; clicked => { root.paste-art(); } }
                             IconButton { label: "+"; tip: "Import artwork"; clicked => { root.import-art(); } }
                         }
@@ -760,11 +814,31 @@ export component AppWindow inherits Window {
                                     enabled: root.selected-row >= 0 && !root.bg-busy;
                                     toggled => { root.prop-remove-bg(self.checked); }
                                 }
-                                CheckBox { text: "Eraser (drag on the art)"; checked <=> root.eraser; enabled: root.selected-row >= 0; }
+                                CheckBox { text: "Paint brush (drag on the art)"; checked <=> root.paint; enabled: root.selected-row >= 0; toggled => { if self.checked { root.eraser = false; root.smudge = false; } } }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Swatches { selected: root.paint-color; enabled: root.paint; picked(c) => { root.paint-color = c; root.paint-hue = c.to-hsv().hue; } }
+                                    Button { text: root.picker ? "Click the art…" : "Eyedropper"; enabled: root.paint; clicked => { root.picker = !root.picker; } }
+                                }
+                                if root.paint: HorizontalLayout {
+                                    spacing: 6px;
+                                    ColorPicker { value <=> root.paint-color; hue <=> root.paint-hue; }
+                                    Rectangle { width: 28px; border-radius: 3px; background: root.paint-color; border-width: 1px; border-color: #50555c; }
+                                }
+                                CheckBox { text: "Eraser (drag on the art)"; checked <=> root.eraser; enabled: root.selected-row >= 0; toggled => { if self.checked { root.paint = false; root.smudge = false; } } }
+                                CheckBox { text: "Smudge (drag on the art)"; checked <=> root.smudge; enabled: root.selected-row >= 0; toggled => { if self.checked { root.paint = false; root.eraser = false; } } }
                                 PropRow {
-                                    label: "Eraser size";
-                                    Slider { minimum: 1; maximum: 40; value <=> root.eraser-size; enabled: root.eraser; }
+                                    label: "Brush size";
+                                    Slider { minimum: 1; maximum: 40; value <=> root.eraser-size; enabled: root.eraser || root.paint || root.smudge; }
                                     Text { text: "\{round(root.eraser-size)} px"; color: #d8dce2; width: 38px; vertical-alignment: center; font-size: 12px; }
+                                }
+                                PropRow {
+                                    label: "Shirt colour";
+                                    Swatches { picked(c) => { root.set-base-color(c); } }
+                                }
+                                Button {
+                                    text: "Shirt = brush colour";
+                                    clicked => { root.set-base-color(root.paint-color); }
                                 }
                                 Button {
                                     text: "Match shirt to art background";

@@ -94,11 +94,7 @@ pub fn mesh(rig: &[BoxPart]) -> (Vec<Vertex>, Vec<u32>) {
             let (tl, right, down) = face_frame(face, b.center, b.half);
             let n = down.cross(right).normalize();
             let (uv0, uv1) = match b.part {
-                Some(p) => {
-                    let r = template::region(p, face);
-                    let (w, h) = (template::W as f32, template::H as f32);
-                    ([r.x as f32 / w, r.y as f32 / h], [(r.x + r.w) as f32 / w, (r.y + r.h) as f32 / h])
-                }
+                Some(p) => (template_uv(p, face, 0.0, 0.0), template_uv(p, face, 1.0, 1.0)),
                 None => ([0.0; 2], [0.0; 2]),
             };
             let color = [b.color[0], b.color[1], b.color[2], texture_flag(b.part)];
@@ -121,7 +117,9 @@ pub fn mesh(rig: &[BoxPart]) -> (Vec<Vertex>, Vec<u32>) {
 fn template_uv(part: Part, face: Face, s: f32, t: f32) -> [f32; 2] {
     let r = template::region(part, face);
     let (s, t) = (s.clamp(0.0, 1.0), t.clamp(0.0, 1.0));
-    [(r.x as f32 + s * r.w as f32) / template::W as f32, (r.y as f32 + t * r.h as f32) / template::H as f32]
+    // stop half a texel inside the region so linear filtering never pulls in the neighbouring face (seam lines)
+    let (x, y) = (r.x as f32 + 0.5 + s * (r.w as f32 - 1.0), r.y as f32 + 0.5 + t * (r.h as f32 - 1.0));
+    [x / template::W as f32, y / template::H as f32]
 }
 
 /// Which rig box an OBJ object belongs to, by Roblox body-part name.
@@ -186,7 +184,9 @@ pub fn load_obj(text: &str, offset: Vec3, rig: &[BoxPart]) -> Result<(Vec<Vertex
 fn push_tri(out: &mut Vec<Vertex>, b: &BoxPart, p: [Vec3; 3]) {
     let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
     let a = n.abs();
-    let side = if a.x >= a.z {
+    // 45-degree bevels tie x and z; rounding flipped neighbouring slivers between textures
+    // (zebra stripes), so front/back wins unless the face clearly points sideways.
+    let side = if a.x > a.z + 0.1 {
         if n.x > 0.0 { Face::Left } else { Face::Right }
     } else if n.z > 0.0 {
         Face::Front
@@ -356,7 +356,8 @@ mod tests {
     fn mesh_front_torso_uvs_match_template_region() {
         let (v, _) = mesh(&rig());
         let r = template::region(Part::Torso, Face::Front);
-        let want = [r.x as f32 / template::W as f32, r.y as f32 / template::H as f32];
+        let want = template_uv(Part::Torso, Face::Front, 0.0, 0.0);
+        assert!(want[0] > r.x as f32 / template::W as f32, "inset off the seam");
         // torso is rig[1], Front is the first face -> vertices 24..28; first is top-left
         let tl = v[24];
         assert_eq!(tl.pos, [-1.0, 1.0, 0.5]);
@@ -386,10 +387,10 @@ mod tests {
         let r = template::region(Part::Torso, Face::Front);
         let (w, h) = (template::W as f32, template::H as f32);
         let tl = v.iter().find(|x| x.pos == [-1.0, 1.0, 0.5]).unwrap();
-        assert_eq!(tl.uv, [r.x as f32 / w, r.y as f32 / h]);
+        assert_eq!(tl.uv, template_uv(Part::Torso, Face::Front, 0.0, 0.0));
         // y=2.4 is 0.8 of the way down the 2-stud torso
         let bl = v.iter().find(|x| x.pos[0] == -1.0 && (x.pos[1] + 0.6).abs() < 1e-5).unwrap();
-        assert!((bl.uv[1] - (r.y as f32 + 0.8 * r.h as f32) / h).abs() < 1e-5);
+        assert!((bl.uv[1] - template_uv(Part::Torso, Face::Front, 0.0, 0.8)[1]).abs() < 1e-5);
         assert!(load_obj("o Neck_Att\nv 0 0 0\n", R15_OFFSET, &rig()).is_err());
         // Upward-facing step at the waist (y=2.4, interior) must not sample the Top region.
         let step = "o LowerTorso_Geo\nv -0.2 2.4 0.5\nv 0.2 2.4 0.5\nv 0 2.4 0.3\nf 1 2 3\n";

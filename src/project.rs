@@ -131,6 +131,9 @@ struct LayerFile {
     /// Index into `images` of the eraser mask, if the layer was erased.
     #[serde(default)]
     erased: Option<usize>,
+    /// Index into `images` of the brush paint, if painted.
+    #[serde(default)]
+    painted: Option<usize>,
 }
 
 fn one() -> f32 {
@@ -200,6 +203,7 @@ pub fn to_json(shirt: (&Document, Option<&str>), pants: (&Document, Option<&str>
                 across: l.across,
                 stretch: l.stretch,
                 erased: l.erased.as_ref().map(&mut id),
+                painted: l.painted.as_ref().map(&mut id),
             })
             .collect();
         let mut file = |o: &Overlay| OverlayFile { image: id(&o.image), strength: o.strength, preset: o.preset, name: o.name.clone(), ink: o.ink };
@@ -271,6 +275,7 @@ pub fn from_json(text: &str) -> Result<(GarmentDoc, Option<GarmentDoc>), String>
             let fresh = Layer::new(String::new(), RgbaImage::new(1, 1));
             let mask = lf.mask.map(get).transpose()?.filter(|m| m.dimensions() == source.dimensions());
             let erased = lf.erased.map(get).transpose()?.filter(|e| e.dimensions() == source.dimensions());
+            let painted = lf.painted.map(get).transpose()?.filter(|e| e.dimensions() == source.dimensions());
             let upscaled = lf.upscaled.map(get).transpose()?.filter(|u| u.dimensions() == (source.width() * 4, source.height() * 4));
             let mut layer = Layer {
                 name: lf.name,
@@ -285,6 +290,7 @@ pub fn from_json(text: &str) -> Result<(GarmentDoc, Option<GarmentDoc>), String>
                 across: lf.across,
                 stretch: finite(lf.stretch, 0.05, 20.0, 1.0),
                 erased,
+                painted,
                 upscaled,
                 visible: lf.visible,
                 wrap: lf.wrap,
